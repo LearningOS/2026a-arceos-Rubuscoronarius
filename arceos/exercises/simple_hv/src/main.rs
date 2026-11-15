@@ -3,29 +3,29 @@
 #![feature(asm_const)]
 #![feature(riscv_ext_intrinsics)]
 
+extern crate alloc;
 #[cfg(feature = "axstd")]
 extern crate axstd as std;
-extern crate alloc;
 #[macro_use]
 extern crate axlog;
 
+mod csrs;
+mod loader;
+mod regs;
+mod sbi;
 mod task;
 mod vcpu;
-mod regs;
-mod csrs;
-mod sbi;
-mod loader;
 
-use vcpu::VmCpuRegisters;
-use riscv::register::{scause, sstatus, stval};
-use csrs::defs::hstatus;
-use tock_registers::LocalRegisterCopy;
-use csrs::{RiscvCsrTrait, CSR};
-use vcpu::_run_guest;
-use sbi::SbiMessage;
-use loader::load_vm_image;
-use axhal::mem::PhysAddr;
 use crate::regs::GprIndex::{A0, A1};
+use axhal::mem::PhysAddr;
+use csrs::defs::hstatus;
+use csrs::{RiscvCsrTrait, CSR};
+use loader::load_vm_image;
+use riscv::register::{scause, sstatus, stval};
+use sbi::SbiMessage;
+use tock_registers::LocalRegisterCopy;
+use vcpu::_run_guest;
+use vcpu::VmCpuRegisters;
 
 const VM_ENTRY: usize = 0x8020_0000;
 
@@ -50,10 +50,9 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
-    }
+    while !run_guest(&mut ctx) {}
 
-    panic!("Hypervisor ok!");
+    ax_println!("Hypervisor ok!");
 }
 
 fn prepare_vm_pgtable(ept_root: PhysAddr) {
@@ -94,25 +93,43 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         assert_eq!(a1, 0x1234);
                         ax_println!("Shutdown vm normally!");
                         return true;
-                    },
+                    }
                     _ => todo!(),
                 }
             } else {
                 panic!("bad sbi message! ");
             }
-        },
+        }
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
-        },
+            // The guest reads mhartid, a machine-mode CSR unavailable to VS mode.
+            let instruction = stval::read();
+            if instruction == 0xf140_25f3 {
+                ctx.guest_regs.gprs.set_reg(A1, 0x1234);
+                ctx.guest_regs.sepc += 4;
+            } else {
+                panic!(
+                    "Bad instruction: {:#x} sepc: {:#x}",
+                    instruction, ctx.guest_regs.sepc
+                );
+            }
+        }
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
-        },
+            // Emulate the guest's load from the virtual device at GPA 0x40.
+            let htval: usize;
+            unsafe {
+                core::arch::asm!("csrr {}, htval", out(reg) htval);
+            }
+            let gpa = (htval << 2) | (stval::read() & 3);
+            if gpa == 0x40 {
+                ctx.guest_regs.gprs.set_reg(A0, 0x6688);
+                ctx.guest_regs.sepc += 4;
+            } else {
+                panic!(
+                    "LoadGuestPageFault: {:#x} sepc: {:#x}",
+                    gpa, ctx.guest_regs.sepc
+                );
+            }
+        }
         _ => {
             panic!(
                 "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",
@@ -127,9 +144,8 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Set hstatus
-    let mut hstatus = LocalRegisterCopy::<usize, hstatus::Register>::new(
-        riscv::register::hstatus::read().bits(),
-    );
+    let mut hstatus =
+        LocalRegisterCopy::<usize, hstatus::Register>::new(riscv::register::hstatus::read().bits());
     // Set Guest bit in order to return to guest mode.
     hstatus.modify(hstatus::spv::Guest);
     // Set SPVP bit in order to accessing VS-mode memory from HS-mode.

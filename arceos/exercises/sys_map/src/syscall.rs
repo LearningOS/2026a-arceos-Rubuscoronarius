@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
+use arceos_posix_api as api;
 use axerrno::LinuxError;
+use axhal::arch::TrapFrame;
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
 use axtask::current;
 use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
-use arceos_posix_api as api;
+use core::ffi::{c_char, c_int, c_void};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -100,9 +100,14 @@ bitflags::bitflags! {
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ax_println!("handle_syscall [{}] ...", syscall_num);
     let ret = match syscall_num {
-         SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+        SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
         SYS_SET_TID_ADDRESS => sys_set_tid_address(tf.arg0() as _),
-        SYS_OPENAT => sys_openat(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _),
+        SYS_OPENAT => sys_openat(
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         SYS_CLOSE => sys_close(tf.arg0() as _),
         SYS_READ => sys_read(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         SYS_WRITE => sys_write(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
@@ -110,11 +115,11 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         SYS_EXIT_GROUP => {
             ax_println!("[SYS_EXIT_GROUP]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_EXIT => {
             ax_println!("[SYS_EXIT]: system is exiting ..");
             axtask::exit(tf.arg0() as _)
-        },
+        }
         SYS_MMAP => sys_mmap(
             tf.arg0() as _,
             tf.arg1() as _,
@@ -138,9 +143,79 @@ fn sys_mmap(
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use axhal::mem::{MemoryAddr, VirtAddr, PAGE_SIZE_4K};
+    use memory_addr::VirtAddrRange;
+    let invalid = -(LinuxError::EINVAL.code() as isize);
+    let no_memory = -(LinuxError::ENOMEM.code() as isize);
+    let prot = match MmapProt::from_bits(prot) {
+        Some(p) => p,
+        None => return invalid,
+    };
+    let flags = match MmapFlags::from_bits(flags) {
+        Some(f) => f,
+        None => return invalid,
+    };
+    if length == 0
+        || offset < 0
+        || offset as usize % PAGE_SIZE_4K != 0
+        || !flags.contains(MmapFlags::MAP_PRIVATE)
+        || flags.contains(MmapFlags::MAP_SHARED)
+        || flags.contains(MmapFlags::MAP_FIXED)
+    {
+        return invalid;
+    }
+    let size = match length.checked_add(PAGE_SIZE_4K - 1) {
+        Some(n) => n & !(PAGE_SIZE_4K - 1),
+        None => return no_memory,
+    };
+    let curr = current();
+    let mut space = curr.task_ext().aspace.lock();
+    let hint = if addr.is_null() {
+        VirtAddr::from(0x1000_0000usize)
+    } else {
+        VirtAddr::from((addr as usize) & !(PAGE_SIZE_4K - 1))
+    };
+    let range = VirtAddrRange::from_start_size(space.base(), space.size());
+    let start = match space.find_free_area(hint, size, range) {
+        Some(start) => start,
+        None => return no_memory,
+    };
+    let mapping_flags = MappingFlags::from(prot);
+    if space.map_alloc(start, size, mapping_flags, true).is_err() {
+        return no_memory;
+    }
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+        let old = api::sys_lseek(fd, 0, 1);
+        if old < 0 {
+            return old as isize;
+        }
+        let seek = api::sys_lseek(fd, offset as _, 0);
+        if seek < 0 {
+            return seek as isize;
+        }
+        let mut buf = [0u8; PAGE_SIZE_4K];
+        let mut done = 0;
+        while done < length {
+            let count = (length - done).min(buf.len());
+            let n = api::sys_read(fd, buf.as_mut_ptr().cast(), count);
+            if n < 0 {
+                api::sys_lseek(fd, old, 0);
+                return n as isize;
+            }
+            if n == 0 {
+                break;
+            }
+            if space.write(start + done, &buf[..n as usize]).is_err() {
+                api::sys_lseek(fd, old, 0);
+                return -(LinuxError::EFAULT.code() as isize);
+            }
+            done += n as usize;
+        }
+        api::sys_lseek(fd, old, 0);
+    }
+    start.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

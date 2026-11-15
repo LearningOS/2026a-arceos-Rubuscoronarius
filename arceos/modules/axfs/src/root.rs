@@ -133,12 +133,13 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
+        self.lookup_mounted_fs(src_path, |src_fs, src| {
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst| {
+                if src.is_empty() || dst.is_empty() || !Arc::ptr_eq(&src_fs, &dst_fs) {
+                    return ax_err!(PermissionDenied);
+                }
+                src_fs.root_dir().rename(src, dst)
+            })
         })
     }
 }
@@ -302,9 +303,52 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
+    let old = absolute_path(old)?;
+    let new = absolute_path(new)?;
+    let source = lookup(None, &old)?;
+    if old == new {
+        return Ok(());
     }
-    parent_node_of(None, old).rename(old, new)
+    if lookup(None, &new).is_ok() {
+        remove_file(None, &new)?;
+    }
+    match ROOT_DIR.rename(&old, &new) {
+        Ok(()) => Ok(()),
+        Err(AxError::Unsupported) => {
+            // Some RAMFS implementations do not provide rename. Support the
+            // exercise's same-directory file operation via the VFS interface.
+            let old_parent = old.rsplit_once('/').map(|p| p.0);
+            let new_parent = new.rsplit_once('/').map(|p| p.0);
+            if old_parent != new_parent || !source.get_attr()?.is_file() {
+                return ax_err!(Unsupported);
+            }
+            let target = create_file(None, &new)?;
+            let result = (|| {
+                let mut offset = 0u64;
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = source.read_at(offset, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    let mut written = 0;
+                    while written < n {
+                        let count = target.write_at(offset + written as u64, &buf[written..n])?;
+                        if count == 0 {
+                            return ax_err!(BadState);
+                        }
+                        written += count;
+                    }
+                    offset += n as u64;
+                }
+                Ok(())
+            })();
+            if let Err(err) = result {
+                let _ = remove_file(None, &new);
+                return Err(err);
+            }
+            remove_file(None, &old)
+        }
+        Err(err) => Err(err),
+    }
 }
